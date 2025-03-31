@@ -1,0 +1,1149 @@
+import sys
+import csv
+import time
+import datetime
+import threading
+import json
+from pathlib import Path
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QTableWidget,
+                             QTableWidgetItem, QVBoxLayout, QWidget,
+                             QPushButton, QLabel, QTabWidget, QComboBox,
+                             QToolBar, QLineEdit, QHBoxLayout, QMessageBox,
+                             QMenu, QTimeEdit, QCheckBox)
+from PyQt6.QtCore import QTimer, Qt, QTime
+from PyQt6.QtGui import QAction, QColor
+import pandas as pd
+from playsound import playsound
+import MetaTrader5 as mt5
+from zoneinfo import ZoneInfo
+
+
+class NonScrollableComboBox(QComboBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
+class TimeEdit(QTimeEdit):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDisplayFormat("HH:mm:ss")
+        self.setTime(QTime(0, 0, 0))
+        self.setMinimumTime(QTime(0, 0, 0))
+        self.setMaximumTime(QTime(23, 59, 59))
+        self.setStyleSheet("""
+            QTimeEdit {
+                background-color: white;
+                border: 1px solid #ccc;
+                padding: 2px;
+                min-width: 80px;
+            }
+            QTimeEdit:focus {
+                border: 2px solid #1E90FF;
+            }
+            QTimeEdit::up-button {
+                width: 16px;
+                height: 12px;
+                subcontrol-origin: border;
+                subcontrol-position: top right;
+            }
+            QTimeEdit::down-button {
+                width: 16px;
+                height: 12px;
+                subcontrol-origin: border;
+                subcontrol-position: bottom right;
+            }
+            QTimeEdit::up-arrow {
+                width: 10px;
+                height: 10px;
+            }
+            QTimeEdit::down-arrow {
+                width: 10px;
+                height: 10px;
+            }
+        """)
+
+    def setText(self, text):
+        try:
+            time = QTime.fromString(text, "HH:mm:ss")
+            if not time.isValid():
+                time = QTime.fromString(text, "h:mm:ss")
+            if time.isValid():
+                self.setTime(time)
+        except:
+            pass
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
+class PriceMonitor(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Price Monitor")
+        self.setGeometry(100, 100, 1400, 800)
+
+        self.tz = ZoneInfo("Asia/Shanghai")
+        self.auto_fit_enabled = True
+        self.csv_lock = threading.Lock()
+        self.config_file = "app_config.json"  # 儲存設定的檔案
+
+        if not mt5.initialize():
+            print("Failed to initialize MT5")
+            sys.exit()
+
+        self.default_symbols = [
+            "XAUUSD", "XAGUSD", "PLT", "PAD", "COPPER", "IRON", "GAUCNH", "XALUSD",
+            "HKGHKD", "XNIUSD", "XZNUSD", "AUDUSD", "EURUSD", "GBPUSD", "NZDUSD",
+            "USDCAD", "USDCHF", "USDJPY", "EURJPY", "NZDJPY", "GBPJPY", "CADJPY",
+            "AUDJPY", "EURCHF", "EURGBP", "EURAUD", "GBPCHF", "GBPAUD", "AUDNZD",
+            "EURCAD", "EURNZD", "GBPCAD", "AUDCAD", "NZDCAD", "USDCNH", "HKDCNH",
+            "USOil", "UKOil", "NGAS", "CHINA300", "HK50", "JPN225", "A50", "STI",
+            "AS200", "INDIA50", "KS200", "SH50", "VN30", "DJ30", "SP500", "TECH100",
+            "RUSS2000", "USDINDEX", "GER30", "FRA40", "UK100", "EUR50", "EUR600",
+            "AEX25", "SOYBEAN", "CORN", "WHEAT", "COCOA", "COFFEE", "SUGAR", "COTTON",
+            "00005.HK", "AAPL", "BTCUSDT", "ETHUSDT"
+        ]
+
+        self.symbols = []
+        self.wav_paths = {}
+        self.wav_paths_resume = {}
+        self.custom_times = {}
+        self.alert_enabled = {}
+        self.order_options = {}
+
+        # 載入上次儲存的設定
+        self.load_config()
+        self.load_symbols_from_file()
+        self.setup_ui()
+        self.load_last_parameters()  # 在設定 UI 後載入參數
+
+        self.last_prices = {}
+        self.running = False
+        self.csv_file = "MT5_Latest_Price_All.csv"
+
+        self.price_thread = None
+        self.refresh_timer = QTimer()
+        self.refresh_timer.timeout.connect(self.update_display)
+        self.status_label.setText("Status: Stopped")
+
+    def load_config(self):
+        """載入上次儲存的應用程式設定"""
+        if Path(self.config_file).exists():
+            try:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    self.last_product_path = config.get('product_path', str(Path('product_list.csv').absolute()))
+                    self.last_clock = config.get('clock', None)
+            except Exception as e:
+                print(f"Error loading config: {e}")
+                self.last_product_path = str(Path('product_list.csv').absolute())
+                self.last_clock = None
+        else:
+            self.last_product_path = str(Path('product_list.csv').absolute())
+            self.last_clock = None
+
+    def save_config(self):
+        """儲存當前應用程式設定"""
+        config = {
+            'product_path': self.product_path_input.text().strip(),
+            'clock': self.clock_combo.currentText() if self.clock_combo.count() > 0 else None
+        }
+        try:
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump(config, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            print(f"Error saving config: {e}")
+
+    def load_symbols_from_file(self):
+        product_file = self.last_product_path if hasattr(self, 'last_product_path') else "product_list.csv"
+        if Path(product_file).exists():
+            try:
+                with open(product_file, 'r') as f:
+                    reader = csv.reader(f)
+                    self.symbols = []
+                    self.wav_paths.clear()
+                    self.wav_paths_resume.clear()
+                    self.alert_enabled.clear()
+                    self.custom_times.clear()
+                    for row in reader:
+                        if row and row[0].strip():
+                            symbol = row[0].strip()
+                            self.symbols.append(symbol)
+                            self.wav_paths[symbol] = row[1].strip() if len(row) > 1 else ""
+                            self.wav_paths_resume[symbol] = row[2].strip() if len(row) > 2 else ""
+                            self.alert_enabled[symbol] = True
+                            self.custom_times[symbol] = "00:00:00"
+            except Exception as e:
+                print(f"Error loading product list: {e}. Using default symbols.")
+                self.symbols = self.default_symbols.copy()
+                self.wav_paths = {symbol: "" for symbol in self.default_symbols}
+                self.wav_paths_resume = {symbol: "" for symbol in self.default_symbols}
+                self.alert_enabled = {symbol: True for symbol in self.default_symbols}
+                self.custom_times = {symbol: "00:00:00" for symbol in self.default_symbols}
+        else:
+            print(f"Product file '{product_file}' not found. Using default symbols.")
+            self.symbols = self.default_symbols.copy()
+            self.wav_paths = {symbol: "" for symbol in self.default_symbols}
+            self.wav_paths_resume = {symbol: "" for symbol in self.default_symbols}
+            self.alert_enabled = {symbol: True for symbol in self.default_symbols}
+            self.custom_times = {symbol: "00:00:00" for symbol in self.default_symbols}
+
+    def load_product_list(self):
+        file_path = self.product_path_input.text().strip() or "product_list.csv"
+        if not Path(file_path).exists():
+            QMessageBox.warning(self, "Warning", f"File not found: {file_path}")
+            return
+
+        try:
+            with open(file_path, 'r') as f:
+                reader = csv.reader(f)
+                new_symbols = []
+                self.wav_paths.clear()
+                self.wav_paths_resume.clear()
+                self.alert_enabled.clear()
+                old_custom_times = self.custom_times.copy()
+                self.custom_times.clear()
+
+                for row in reader:
+                    if row and row[0].strip():
+                        symbol = row[0].strip()
+                        new_symbols.append(symbol)
+                        self.wav_paths[symbol] = row[1].strip() if len(row) > 1 else ""
+                        self.wav_paths_resume[symbol] = row[2].strip() if len(row) > 2 else ""
+                        self.alert_enabled[symbol] = True
+                        self.custom_times[symbol] = old_custom_times.get(symbol, "00:00:00")
+
+                if not new_symbols:
+                    QMessageBox.warning(self, "Warning", "The file is empty or contains no valid symbols!")
+                    return
+
+                self.symbols = new_symbols
+                self.rebuild_price_table()
+                self.rebuild_schedule_table()
+                self.product_table.clearContents()
+                self.product_table.setRowCount(len(self.symbols))
+                for i, symbol in enumerate(self.symbols):
+                    self.product_table.setItem(i, 0, QTableWidgetItem(symbol))
+                    wav_item_stop = QTableWidgetItem(self.wav_paths[symbol])
+                    wav_item_stop.setFlags(wav_item_stop.flags() | Qt.ItemFlag.ItemIsEditable)
+                    self.product_table.setItem(i, 1, wav_item_stop)
+                    wav_item_resume = QTableWidgetItem(self.wav_paths_resume[symbol])
+                    wav_item_resume.setFlags(wav_item_resume.flags() | Qt.ItemFlag.ItemIsEditable)
+                    self.product_table.setItem(i, 2, wav_item_resume)
+
+                QMessageBox.information(self, "Success", f"Product list loaded from '{file_path}'")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load product list: {str(e)}")
+
+    def setup_ui(self):
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        main_layout = QVBoxLayout(main_widget)
+
+        self.create_toolbar()
+
+        control_layout = QHBoxLayout()
+        control_layout.addStretch()
+
+        self.start_button = QPushButton("Start")
+        self.stop_button = QPushButton("Stop")
+        self.start_button.setFixedSize(80, 30)
+        self.stop_button.setFixedSize(80, 30)
+        self.start_button.clicked.connect(self.start_monitoring)
+        self.stop_button.clicked.connect(self.stop_monitoring)
+        control_layout.addWidget(self.start_button)
+        control_layout.addWidget(self.stop_button)
+
+        path_layout = QHBoxLayout()
+        path_layout.addStretch()
+
+        product_path_layout = QHBoxLayout()
+        product_path_layout.addWidget(QLabel("Product List:"))
+        self.product_path_input = QLineEdit(
+            self.last_product_path if hasattr(self, 'last_product_path') else str(Path('product_list.csv').absolute()))
+        self.product_path_input.setMinimumWidth(300)
+        product_path_layout.addWidget(self.product_path_input)
+
+        params_path_layout = QHBoxLayout()
+        params_path_layout.addWidget(QLabel("Parameters:"))
+        self.params_path_input = QLineEdit(f"{Path('trading_schedule_parameters.csv').absolute()}")
+        self.params_path_input.setMinimumWidth(300)
+        params_path_layout.addWidget(self.params_path_input)
+
+        path_layout.addLayout(product_path_layout)
+        path_layout.addSpacing(10)
+        path_layout.addLayout(params_path_layout)
+
+        main_layout.addLayout(control_layout)
+
+        self.tabs = QTabWidget()
+        main_layout.addWidget(self.tabs)
+
+        self.create_price_tab()
+        self.create_schedule_tab()
+        self.create_product_list_tab()
+
+        main_layout.addLayout(path_layout)
+
+    def load_last_parameters(self):
+        """載入上次儲存的轉令參數"""
+        if hasattr(self, 'last_clock') and self.last_clock and self.last_clock in self.order_options:
+            param_path = self.order_options[self.last_clock]
+            if Path(param_path).exists():
+                self.apply_clock_parameters_from_file(param_path)
+                self.clock_combo.setCurrentText(self.last_clock)
+
+    def apply_clock_parameters_from_file(self, param_path):
+        """從指定的檔案載入轉令參數"""
+        try:
+            with open(param_path, 'r') as f:
+                reader = csv.reader(f)
+                headers = next(reader)  # 跳過標頭
+                for row in reader:
+                    if not row or len(row) < 13:
+                        continue
+                    symbol = row[0].strip()
+                    if symbol not in self.symbols:
+                        continue
+
+                    row_idx = self.symbols.index(symbol)
+
+                    # 更新時間容忍度
+                    time_tolerance = QTime.fromString(row[1].strip(), "HH:mm:ss")
+                    if not time_tolerance.isValid():
+                        time_tolerance = QTime.fromString(row[1].strip(), "h:mm:ss")
+                    if time_tolerance.isValid():
+                        self.price_table.cellWidget(row_idx, 6).setTime(time_tolerance)
+                        self.custom_times[symbol] = time_tolerance.toString("HH:mm:ss")
+
+                    # 更新 schedule_table
+                    self.schedule_table.setItem(row_idx, 1, QTableWidgetItem(row[2]))  # Product Group
+                    self.schedule_table.cellWidget(row_idx, 2).setCurrentText(row[3])  # Start Day
+
+                    start_time = QTime.fromString(row[4].strip(), "HH:mm:ss")
+                    if not start_time.isValid():
+                        start_time = QTime.fromString(row[4].strip(), "h:mm:ss")
+                    if start_time.isValid():
+                        self.schedule_table.cellWidget(row_idx, 3).setTime(start_time)
+
+                    self.schedule_table.cellWidget(row_idx, 4).setCurrentText(row[5])  # End Day
+
+                    end_time = QTime.fromString(row[6].strip(), "HH:mm:ss")
+                    if not end_time.isValid():
+                        end_time = QTime.fromString(row[6].strip(), "h:mm:ss")
+                    if end_time.isValid():
+                        self.schedule_table.cellWidget(row_idx, 5).setTime(end_time)
+
+                    # 更新休息時間
+                    for col, value in zip(range(6, 12), row[7:13]):
+                        break_time = QTime.fromString(value.strip(), "HH:mm:ss")
+                        if not break_time.isValid():
+                            break_time = QTime.fromString(value.strip(), "h:mm:ss")
+                        if break_time.isValid():
+                            self.schedule_table.cellWidget(row_idx, col).setTime(break_time)
+        except Exception as e:
+            print(f"Failed to load parameters from {param_path}: {str(e)}")
+
+    def create_price_tab(self):
+        price_tab = QWidget()
+        price_layout = QVBoxLayout(price_tab)
+
+        self.status_label = QLabel("Last Refresh: Not yet refreshed | Status: Stopped")
+        price_layout.addWidget(self.status_label)
+
+        self.price_table = QTableWidget()
+        self.price_table.setColumnCount(10)
+        self.price_table.setRowCount(len(self.symbols))
+        self.price_table.setHorizontalHeaderLabels(
+            ["", "Symbol", "Time", "Bid", "Ask", "Time Diff", "Time Tolerance", "Status", "Alert", "Voice Alert"])
+
+        for i, symbol in enumerate(self.symbols):
+            checkbox = QCheckBox()
+            checkbox.setChecked(self.alert_enabled.get(symbol, True))
+            checkbox.stateChanged.connect(
+                lambda state, s=symbol: self.alert_enabled.__setitem__(s, state == Qt.CheckState.Checked.value))
+            self.price_table.setCellWidget(i, 0, checkbox)
+
+            self.price_table.setItem(i, 1, QTableWidgetItem(symbol))
+
+            time_tolerance_edit = TimeEdit()
+            time_tolerance_edit.setTime(QTime.fromString(self.custom_times.get(symbol, "00:00:00"), "HH:mm:ss"))
+            self.price_table.setCellWidget(i, 6, time_tolerance_edit)
+
+            status_item = QTableWidgetItem("Close")
+            status_item.setBackground(QColor(255, 200, 200))
+            self.price_table.setItem(i, 7, status_item)
+
+            alert_item = QTableWidgetItem("Off")
+            alert_item.setBackground(QColor(255, 200, 200))
+            self.price_table.setItem(i, 8, alert_item)
+
+            voice_alert_item = QTableWidgetItem("")
+            voice_alert_item.setFlags(voice_alert_item.flags() | Qt.ItemFlag.ItemIsEditable)
+            self.price_table.setItem(i, 9, voice_alert_item)
+
+        self.price_table.setColumnWidth(9, 100)
+        price_layout.addWidget(self.price_table)
+        self.tabs.addTab(price_tab, "Price Monitor")
+
+    def create_schedule_tab(self):
+        schedule_tab = QWidget()
+        schedule_layout = QVBoxLayout(schedule_tab)
+
+        self.schedule_table = QTableWidget()
+        self.schedule_table.setColumnCount(12)
+        self.schedule_table.setRowCount(len(self.symbols))
+        self.schedule_table.setHorizontalHeaderLabels([
+            "Symbol", "Product Group", "Start Day", "Start Time", "End Day", "End Time",
+            "Break 1 Start", "Break 1 End", "Break 2 Start", "Break 2 End",
+            "Break 3 Start", "Break 3 End"
+        ])
+
+        days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+        for i, symbol in enumerate(self.symbols):
+            self.schedule_table.setItem(i, 0, QTableWidgetItem(symbol))
+
+            item = QTableWidgetItem("")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
+            self.schedule_table.setItem(i, 1, item)
+
+            start_day_combo = NonScrollableComboBox()
+            start_day_combo.addItems(days)
+            self.schedule_table.setCellWidget(i, 2, start_day_combo)
+
+            start_time_edit = TimeEdit()
+            start_time_edit.setTime(QTime(0, 0, 0))
+            self.schedule_table.setCellWidget(i, 3, start_time_edit)
+
+            end_day_combo = NonScrollableComboBox()
+            end_day_combo.addItems(days)
+            self.schedule_table.setCellWidget(i, 4, end_day_combo)
+
+            end_time_edit = TimeEdit()
+            end_time_edit.setTime(QTime(0, 0, 0))
+            self.schedule_table.setCellWidget(i, 5, end_time_edit)
+
+            for col in range(6, 12, 2):
+                start_edit = TimeEdit()
+                start_edit.setTime(QTime(0, 0, 0))
+                self.schedule_table.setCellWidget(i, col, start_edit)
+
+                end_edit = TimeEdit()
+                end_edit.setTime(QTime(0, 0, 0))
+                self.schedule_table.setCellWidget(i, col + 1, end_edit)
+
+        schedule_layout.addWidget(self.schedule_table)
+
+        clock_layout = QHBoxLayout()
+        clock_layout.addStretch()
+
+        clock_label = QLabel("轉令:")
+        clock_layout.addWidget(clock_label)
+
+        self.clock_combo = NonScrollableComboBox()
+        self.load_clock_options()
+        clock_layout.addWidget(self.clock_combo)
+
+        self.clock_apply_button = QPushButton("Apply")
+        self.clock_apply_button.clicked.connect(self.apply_clock_parameters)
+        clock_layout.addWidget(self.clock_apply_button)
+
+        clock_layout.addStretch()
+        schedule_layout.addLayout(clock_layout)
+
+        self.tabs.addTab(schedule_tab, "Trading Schedule")
+
+    def create_product_list_tab(self):
+        product_tab = QWidget()
+        product_layout = QVBoxLayout(product_tab)
+
+        self.product_table = QTableWidget()
+        self.product_table.setColumnCount(3)
+        self.product_table.setRowCount(len(self.symbols))
+        self.product_table.setHorizontalHeaderLabels(["Symbol", "WAV Path（停價）", "WAV Path（報價恢復）"])
+        self.product_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.product_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+
+        for i, symbol in enumerate(self.symbols):
+            self.product_table.setItem(i, 0, QTableWidgetItem(symbol))
+            wav_item_stop = QTableWidgetItem(self.wav_paths.get(symbol, ""))
+            wav_item_stop.setFlags(wav_item_stop.flags() | Qt.ItemFlag.ItemIsEditable)
+            self.product_table.setItem(i, 1, wav_item_stop)
+            wav_item_resume = QTableWidgetItem(self.wav_paths_resume.get(symbol, ""))
+            wav_item_resume.setFlags(wav_item_resume.flags() | Qt.ItemFlag.ItemIsEditable)
+            self.product_table.setItem(i, 2, wav_item_resume)
+
+        product_layout.addWidget(self.product_table)
+
+        button_layout = QHBoxLayout()
+        self.add_button = QPushButton("Add Product")
+        self.remove_button = QPushButton("Remove Selected")
+        self.move_up_button = QPushButton("Move Up")
+        self.move_down_button = QPushButton("Move Down")
+        self.apply_button = QPushButton("Apply Changes")
+
+        self.add_button.clicked.connect(self.add_product)
+        self.remove_button.clicked.connect(self.remove_product)
+        self.move_up_button.clicked.connect(self.move_product_up)
+        self.move_down_button.clicked.connect(self.move_product_down)
+        self.apply_button.clicked.connect(self.apply_product_changes)
+
+        button_layout.addWidget(self.add_button)
+        button_layout.addWidget(self.remove_button)
+        button_layout.addWidget(self.move_up_button)
+        button_layout.addWidget(self.move_down_button)
+        button_layout.addWidget(self.apply_button)
+
+        product_layout.addLayout(button_layout)
+        self.tabs.addTab(product_tab, "Product List")
+
+    def rebuild_price_table(self):
+        old_tolerance = {symbol: self.custom_times.get(symbol, "00:00:00") for symbol in self.symbols}
+        self.price_table.clearContents()
+        self.price_table.setRowCount(len(self.symbols))
+
+        for i, symbol in enumerate(self.symbols):
+            checkbox = QCheckBox()
+            checkbox.setChecked(self.alert_enabled.get(symbol, True))
+            checkbox.stateChanged.connect(
+                lambda state, s=symbol: self.alert_enabled.__setitem__(s, state == Qt.CheckState.Checked.value))
+            self.price_table.setCellWidget(i, 0, checkbox)
+
+            self.price_table.setItem(i, 1, QTableWidgetItem(symbol))
+
+            time_tolerance_edit = TimeEdit()
+            time_tolerance_edit.setTime(QTime.fromString(old_tolerance.get(symbol, "00:00:00"), "HH:mm:ss"))
+            self.price_table.setCellWidget(i, 6, time_tolerance_edit)
+
+            status_item = QTableWidgetItem("Close")
+            status_item.setBackground(QColor(255, 200, 200))
+            self.price_table.setItem(i, 7, status_item)
+
+            alert_item = QTableWidgetItem("Off")
+            alert_item.setBackground(QColor(255, 200, 200))
+            self.price_table.setItem(i, 8, alert_item)
+
+            voice_alert_item = QTableWidgetItem("")
+            voice_alert_item.setFlags(voice_alert_item.flags() | Qt.ItemFlag.ItemIsEditable)
+            self.price_table.setItem(i, 9, voice_alert_item)
+
+        self.price_table.setColumnWidth(9, 100)
+        self.price_table.resizeColumnsToContents()
+        self.price_table.resizeRowsToContents()
+
+    def rebuild_schedule_table(self):
+        old_schedule = {}
+        for i in range(self.schedule_table.rowCount()):
+            symbol = self.schedule_table.item(i, 0).text()
+            product_group = self.schedule_table.item(i, 1).text() if self.schedule_table.item(i, 1) else ""
+            start_day = self.schedule_table.cellWidget(i, 2).currentText()
+            start_time = self.schedule_table.cellWidget(i, 3).time().toString("HH:mm:ss")
+            end_day = self.schedule_table.cellWidget(i, 4).currentText()
+            end_time = self.schedule_table.cellWidget(i, 5).time().toString("HH:mm:ss")
+            breaks = [(self.schedule_table.cellWidget(i, col).time().toString("HH:mm:ss"),
+                       self.schedule_table.cellWidget(i, col + 1).time().toString("HH:mm:ss"))
+                      for col in range(6, 12, 2)]
+            old_schedule[symbol] = (product_group, start_day, start_time, end_day, end_time, breaks)
+
+        self.schedule_table.clearContents()
+        self.schedule_table.setRowCount(len(self.symbols))
+
+        days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+        for i, symbol in enumerate(self.symbols):
+            self.schedule_table.setItem(i, 0, QTableWidgetItem(symbol))
+
+            item = QTableWidgetItem("")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
+            self.schedule_table.setItem(i, 1, item)
+
+            start_day_combo = NonScrollableComboBox()
+            start_day_combo.addItems(days)
+            self.schedule_table.setCellWidget(i, 2, start_day_combo)
+
+            start_time_edit = TimeEdit()
+            start_time_edit.setTime(QTime(0, 0, 0))
+            self.schedule_table.setCellWidget(i, 3, start_time_edit)
+
+            end_day_combo = NonScrollableComboBox()
+            end_day_combo.addItems(days)
+            self.schedule_table.setCellWidget(i, 4, end_day_combo)
+
+            end_time_edit = TimeEdit()
+            end_time_edit.setTime(QTime(0, 0, 0))
+            self.schedule_table.setCellWidget(i, 5, end_time_edit)
+
+            for col in range(6, 12, 2):
+                start_edit = TimeEdit()
+                start_edit.setTime(QTime(0, 0, 0))
+                self.schedule_table.setCellWidget(i, col, start_edit)
+
+                end_edit = TimeEdit()
+                end_edit.setTime(QTime(0, 0, 0))
+                self.schedule_table.setCellWidget(i, col + 1, end_edit)
+
+            if symbol in old_schedule:
+                product_group, start_day, start_time, end_day, end_time, breaks = old_schedule[symbol]
+                self.schedule_table.item(i, 1).setText(product_group)
+                self.schedule_table.cellWidget(i, 2).setCurrentText(start_day)
+                self.schedule_table.cellWidget(i, 3).setTime(QTime.fromString(start_time, "HH:mm:ss"))
+                self.schedule_table.cellWidget(i, 4).setCurrentText(end_day)
+                self.schedule_table.cellWidget(i, 5).setTime(QTime.fromString(end_time, "HH:mm:ss"))
+                for col, (break_start, break_end) in zip(range(6, 12, 2), breaks):
+                    self.schedule_table.cellWidget(i, col).setTime(QTime.fromString(break_start, "HH:mm:ss"))
+                    self.schedule_table.cellWidget(i, col + 1).setTime(QTime.fromString(break_end, "HH:mm:ss"))
+
+        self.schedule_table.resizeColumnsToContents()
+        self.schedule_table.resizeRowsToContents()
+
+    def save_product_list(self):
+        file_path = self.product_path_input.text().strip() or "product_list.csv"
+        try:
+            with open(file_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                for row in range(self.product_table.rowCount()):
+                    symbol = self.product_table.item(row, 0).text()
+                    wav_path_stop = self.product_table.item(row, 1).text() if self.product_table.item(row, 1) else ""
+                    wav_path_resume = self.product_table.item(row, 2).text() if self.product_table.item(row, 2) else ""
+                    if symbol:
+                        writer.writerow([symbol, wav_path_stop, wav_path_resume])
+            QMessageBox.information(self, "Success", f"Product list saved to '{file_path}'")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save product list: {str(e)}")
+
+    def save_parameters(self):
+        data = []
+        for row in range(self.schedule_table.rowCount()):
+            row_data = []
+            row_data.append(self.schedule_table.item(row, 0).text())  # Symbol
+            time_tolerance_edit = self.price_table.cellWidget(row, 6)
+            row_data.append(time_tolerance_edit.time().toString(
+                "HH:mm:ss") if time_tolerance_edit else "00:00:00")  # Time Tolerance
+            row_data.append(
+                self.schedule_table.item(row, 1).text() if self.schedule_table.item(row, 1) else "")  # Product Group
+            row_data.append(self.schedule_table.cellWidget(row, 2).currentText())  # Start Day
+            start_time_edit = self.schedule_table.cellWidget(row, 3)
+            row_data.append(
+                start_time_edit.time().toString("HH:mm:ss") if start_time_edit else "00:00:00")  # Start Time
+            row_data.append(self.schedule_table.cellWidget(row, 4).currentText())  # End Day
+            end_time_edit = self.schedule_table.cellWidget(row, 5)
+            row_data.append(end_time_edit.time().toString("HH:mm:ss") if end_time_edit else "00:00:00")  # End Time
+            for col in range(6, 12):
+                time_edit = self.schedule_table.cellWidget(row, col)
+                row_data.append(time_edit.time().toString("HH:mm:ss") if time_edit else "00:00:00")  # Break Times
+            data.append(row_data)
+
+        selected_clock = self.clock_combo.currentText()
+        if selected_clock in self.order_options:
+            file_path = self.order_options[selected_clock]
+        else:
+            file_path = self.params_path_input.text().strip() or "trading_schedule_parameters.csv"
+
+        Path(file_path).parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            with open(file_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["Symbol", "Time Tolerance", "Product Group", "Start Day", "Start Time",
+                                 "End Day", "End Time", "Break 1 Start", "Break 1 End",
+                                 "Break 2 Start", "Break 2 End", "Break 3 Start", "Break 3 End"])
+                writer.writerows(data)
+            QMessageBox.information(self, "Success", f"Parameters saved to '{file_path}'")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save parameters: {str(e)}")
+
+    def add_product(self):
+        row_count = self.product_table.rowCount()
+        self.product_table.insertRow(row_count)
+        self.product_table.setItem(row_count, 0, QTableWidgetItem("NEW_SYMBOL"))
+        wav_item_stop = QTableWidgetItem("")
+        wav_item_stop.setFlags(wav_item_stop.flags() | Qt.ItemFlag.ItemIsEditable)
+        self.product_table.setItem(row_count, 1, wav_item_stop)
+        wav_item_resume = QTableWidgetItem("")
+        wav_item_resume.setFlags(wav_item_resume.flags() | Qt.ItemFlag.ItemIsEditable)
+        self.product_table.setItem(row_count, 2, wav_item_resume)
+
+    def remove_product(self):
+        current_row = self.product_table.currentRow()
+        if current_row >= 0:
+            self.product_table.removeRow(current_row)
+
+    def move_product_up(self):
+        current_row = self.product_table.currentRow()
+        if current_row > 0:
+            symbol = self.product_table.item(current_row, 0).text()
+            wav_path_stop = self.product_table.item(current_row, 1).text()
+            wav_path_resume = self.product_table.item(current_row, 2).text()
+            self.product_table.removeRow(current_row)
+            self.product_table.insertRow(current_row - 1)
+            self.product_table.setItem(current_row - 1, 0, QTableWidgetItem(symbol))
+            wav_item_stop = QTableWidgetItem(wav_path_stop)
+            wav_item_stop.setFlags(wav_item_stop.flags() | Qt.ItemFlag.ItemIsEditable)
+            self.product_table.setItem(current_row - 1, 1, wav_item_stop)
+            wav_item_resume = QTableWidgetItem(wav_path_resume)
+            wav_item_resume.setFlags(wav_item_resume.flags() | Qt.ItemFlag.ItemIsEditable)
+            self.product_table.setItem(current_row - 1, 2, wav_item_resume)
+            self.product_table.setCurrentCell(current_row - 1, 0)
+
+    def move_product_down(self):
+        current_row = self.product_table.currentRow()
+        if current_row >= 0 and current_row < self.product_table.rowCount() - 1:
+            symbol = self.product_table.item(current_row, 0).text()
+            wav_path_stop = self.product_table.item(current_row, 1).text()
+            wav_path_resume = self.product_table.item(current_row, 2).text()
+            self.product_table.removeRow(current_row)
+            self.product_table.insertRow(current_row + 1)
+            self.product_table.setItem(current_row + 1, 0, QTableWidgetItem(symbol))
+            wav_item_stop = QTableWidgetItem(wav_path_stop)
+            wav_item_stop.setFlags(wav_item_stop.flags() | Qt.ItemFlag.ItemIsEditable)
+            self.product_table.setItem(current_row + 1, 1, wav_item_stop)
+            wav_item_resume = QTableWidgetItem(wav_path_resume)
+            wav_item_resume.setFlags(wav_item_resume.flags() | Qt.ItemFlag.ItemIsEditable)
+            self.product_table.setItem(current_row + 1, 2, wav_item_resume)
+            self.product_table.setCurrentCell(current_row + 1, 0)
+
+    def apply_product_changes(self):
+        new_symbols = []
+        self.wav_paths.clear()
+        self.wav_paths_resume.clear()
+        self.alert_enabled.clear()
+        old_custom_times = self.custom_times.copy()
+        self.custom_times.clear()
+
+        for row in range(self.product_table.rowCount()):
+            symbol_item = self.product_table.item(row, 0)
+            wav_item_stop = self.product_table.item(row, 1)
+            wav_item_resume = self.product_table.item(row, 2)
+            if symbol_item and symbol_item.text():
+                symbol = symbol_item.text()
+                new_symbols.append(symbol)
+                self.wav_paths[symbol] = wav_item_stop.text() if wav_item_stop else ""
+                self.wav_paths_resume[symbol] = wav_item_resume.text() if wav_item_resume else ""
+                self.alert_enabled[symbol] = True
+                self.custom_times[symbol] = old_custom_times.get(symbol, "00:00:00")
+
+        if not new_symbols:
+            QMessageBox.warning(self, "Warning", "Product list cannot be empty!")
+            return
+
+        self.symbols = new_symbols
+        self.save_product_list()
+        self.rebuild_price_table()
+        self.rebuild_schedule_table()
+
+        QMessageBox.information(self, "Success", "Product list updated successfully!")
+
+    def load_clock_options(self):
+        """從 clock_change.txt 載入轉令選項"""
+        clock_file = "clock_change.txt"
+        self.order_options = {}
+
+        try:
+            if Path(clock_file).exists():
+                with open(clock_file, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                    self.clock_combo.clear()
+                    for line in lines:
+                        line = line.strip()
+                        if line and ',' in line:
+                            clock_name, param_path = line.split(',', 1)
+                            self.order_options[clock_name.strip()] = param_path.strip()
+                            self.clock_combo.addItem(clock_name.strip())
+            if self.clock_combo.count() == 0:
+                self.clock_combo.addItem("無可用轉令")
+        except Exception as e:
+            print(f"載入轉令選項失敗: {str(e)}")
+            self.clock_combo.addItem("載入失敗")
+
+    def apply_clock_parameters(self):
+        """應用選中的轉令參數"""
+        selected_clock = self.clock_combo.currentText()
+        if selected_clock in self.order_options:
+            param_path = self.order_options[selected_clock]
+            if Path(param_path).exists():
+                try:
+                    old_params = {}
+                    for i in range(self.schedule_table.rowCount()):
+                        symbol = self.schedule_table.item(i, 0).text()
+                        time_tolerance = self.price_table.cellWidget(i, 6).time().toString("HH:mm:ss")
+                        product_group = self.schedule_table.item(i, 1).text() if self.schedule_table.item(i, 1) else ""
+                        start_day = self.schedule_table.cellWidget(i, 2).currentText()
+                        start_time = self.schedule_table.cellWidget(i, 3).time().toString("HH:mm:ss")
+                        end_day = self.schedule_table.cellWidget(i, 4).currentText()
+                        end_time = self.schedule_table.cellWidget(i, 5).time().toString("HH:mm:ss")
+                        breaks = [(self.schedule_table.cellWidget(i, col).time().toString("HH:mm:ss"),
+                                   self.schedule_table.cellWidget(i, col + 1).time().toString("HH:mm:ss"))
+                                  for col in range(6, 12, 2)]
+                        old_params[symbol] = (time_tolerance, product_group, start_day, start_time,
+                                              end_day, end_time, breaks)
+
+                    with open(param_path, 'r') as f:
+                        reader = csv.reader(f)
+                        headers = next(reader)  # 跳過標頭
+                        for row in reader:
+                            if not row or len(row) < 13:
+                                continue
+                            symbol = row[0].strip()
+                            if symbol not in self.symbols:
+                                continue
+
+                            row_idx = self.symbols.index(symbol)
+
+                            time_tolerance = QTime.fromString(row[1].strip(), "HH:mm:ss")
+                            if not time_tolerance.isValid():
+                                time_tolerance = QTime.fromString(row[1].strip(), "h:mm:ss")
+                            if time_tolerance.isValid():
+                                self.price_table.cellWidget(row_idx, 6).setTime(time_tolerance)
+                                self.custom_times[symbol] = time_tolerance.toString("HH:mm:ss")
+
+                            self.schedule_table.setItem(row_idx, 1, QTableWidgetItem(row[2]))  # Product Group
+                            self.schedule_table.cellWidget(row_idx, 2).setCurrentText(row[3])  # Start Day
+
+                            start_time = QTime.fromString(row[4].strip(), "HH:mm:ss")
+                            if not start_time.isValid():
+                                start_time = QTime.fromString(row[4].strip(), "h:mm:ss")
+                            if start_time.isValid():
+                                self.schedule_table.cellWidget(row_idx, 3).setTime(start_time)
+
+                            self.schedule_table.cellWidget(row_idx, 4).setCurrentText(row[5])  # End Day
+
+                            end_time = QTime.fromString(row[6].strip(), "HH:mm:ss")
+                            if not end_time.isValid():
+                                end_time = QTime.fromString(row[6].strip(), "h:mm:ss")
+                            if end_time.isValid():
+                                self.schedule_table.cellWidget(row_idx, 5).setTime(end_time)
+
+                            for col, value in zip(range(6, 12), row[7:13]):
+                                break_time = QTime.fromString(value.strip(), "HH:mm:ss")
+                                if not break_time.isValid():
+                                    break_time = QTime.fromString(value.strip(), "h:mm:ss")
+                                if break_time.isValid():
+                                    self.schedule_table.cellWidget(row_idx, col).setTime(break_time)
+
+                    QMessageBox.information(self, "成功", f"已應用轉令 '{selected_clock}' 的參數")
+                except Exception as e:
+                    QMessageBox.critical(self, "錯誤", f"應用轉令參數失敗: {str(e)}")
+            else:
+                QMessageBox.warning(self, "警告", f"參數檔案不存在: {param_path}")
+        else:
+            QMessageBox.warning(self, "警告", "請選擇有效的轉令")
+
+    def update_display(self):
+        try:
+            with self.csv_lock:
+                if Path(self.csv_file).exists():
+                    df = pd.read_csv(self.csv_file)
+                    current_time = datetime.datetime.now(tz=self.tz)
+
+                    for i, row in df.iterrows():
+                        row_idx = self.symbols.index(row['Symbol'])
+                        symbol_time = datetime.datetime.strptime(row['Time'], '%Y-%m-%d %H:%M:%S').replace(
+                            tzinfo=self.tz)
+
+                        self.price_table.setItem(row_idx, 2, QTableWidgetItem(row['Time']))
+                        self.price_table.setItem(row_idx, 3, QTableWidgetItem(str(row['Bid'])))
+                        self.price_table.setItem(row_idx, 4, QTableWidgetItem(str(row['Ask'])))
+
+                        time_diff = current_time - symbol_time
+                        if time_diff.total_seconds() < 0:
+                            time_diff = datetime.timedelta(seconds=0)
+                        time_diff_str = str(time_diff).split('.')[0]
+                        self.price_table.setItem(row_idx, 5, QTableWidgetItem(time_diff_str))
+
+                        is_trading_now = self.is_trading(row_idx, current_time)
+                        status_item = self.price_table.item(row_idx, 7)
+                        if not status_item:
+                            status_item = QTableWidgetItem()
+                            self.price_table.setItem(row_idx, 7, status_item)
+
+                        if is_trading_now:
+                            status_item.setText("Trading")
+                            status_item.setBackground(Qt.GlobalColor.green)
+                        else:
+                            status_item.setText("Close")
+                            status_item.setBackground(QColor(255, 200, 200))
+
+                        alert_item = self.price_table.item(row_idx, 8)
+                        if not alert_item:
+                            alert_item = QTableWidgetItem()
+                            self.price_table.setItem(row_idx, 8, alert_item)
+
+                        time_tolerance_edit = self.price_table.cellWidget(row_idx, 6)
+                        tolerance_time = QTime.fromString(time_tolerance_edit.time().toString("HH:mm:ss"), "HH:mm:ss")
+                        time_diff_seconds = time_diff.total_seconds()
+                        tolerance_seconds = tolerance_time.hour() * 3600 + tolerance_time.minute() * 60 + tolerance_time.second()
+
+                        symbol = row['Symbol']
+                        voice_alert_item = self.price_table.item(row_idx, 9)
+                        if not voice_alert_item:
+                            voice_alert_item = QTableWidgetItem("")
+                            voice_alert_item.setFlags(voice_alert_item.flags() | Qt.ItemFlag.ItemIsEditable)
+                            self.price_table.setItem(row_idx, 9, voice_alert_item)
+
+                        if (self.alert_enabled[symbol] and
+                                is_trading_now and
+                                time_diff_seconds > tolerance_seconds):
+                            alert_item.setText("On")
+                            alert_item.setBackground(Qt.GlobalColor.green)
+                            if voice_alert_item.text() != "Played":
+                                wav_path = self.wav_paths.get(symbol, "")
+                                if wav_path and Path(wav_path).exists():
+                                    try:
+                                        threading.Thread(target=playsound, args=(wav_path,), daemon=True).start()
+                                        self.log_play_event(symbol, current_time.strftime('%Y-%m-%d %H:%M:%S'))
+                                        voice_alert_item.setText("Played")
+                                    except Exception as e:
+                                        print(f"Failed to play WAV for {symbol}: {str(e)}")
+                        else:
+                            alert_item.setText("Off")
+                            alert_item.setBackground(QColor(255, 200, 200))
+
+                        if (self.alert_enabled[symbol] and
+                                is_trading_now and
+                                time_diff_seconds < tolerance_seconds and
+                                voice_alert_item.text() == "Played"):
+                            voice_alert_item.setText("")
+                            wav_path_resume = self.wav_paths_resume.get(symbol, "")
+                            if wav_path_resume and Path(wav_path_resume).exists():
+                                try:
+                                    threading.Thread(target=playsound, args=(wav_path_resume,), daemon=True).start()
+                                    self.log_play_event(symbol, current_time.strftime('%Y-%m-%d %H:%M:%S'))
+                                except Exception as e:
+                                    print(f"Failed to play resume WAV for {symbol}: {str(e)}")
+
+                    self.status_label.setText(
+                        f"Last Refresh: {current_time.strftime('%Y-%m-%d %H:%M:%S')} | Status: Running"
+                    )
+                    if self.auto_fit_enabled:
+                        self.resize_table_columns()
+
+        except Exception as e:
+            print(f"Display update error: {str(e)}")
+
+    def monitor_prices(self):
+        while self.running:
+            with self.csv_lock:
+                with open(self.csv_file, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["Symbol", "Time", "Bid", "Ask"])
+
+                    for symbol in self.symbols:
+                        try:
+                            mt5.symbol_select(symbol, True)
+                            tick = mt5.symbol_info_tick(symbol)
+                            if tick is not None:
+                                now = datetime.datetime.now(tz=self.tz)
+                                tick_time = datetime.datetime.fromtimestamp(tick.time, tz=self.tz)
+                                if tick_time > now:
+                                    tick_time = now
+                                current_bid = tick.bid
+                                current_ask = tick.ask
+
+                                writer.writerow(
+                                    [symbol, tick_time.strftime('%Y-%m-%d %H:%M:%S'), current_bid, current_ask])
+                                self.last_prices[symbol] = {'bid': current_bid, 'ask': current_ask}
+
+                                self.check_alert_conditions(symbol, current_bid, current_ask)
+
+                        except Exception as e:
+                            print(f"Error with {symbol}: {str(e)}")
+
+            time.sleep(0.1)
+
+    def check_alert_conditions(self, symbol, bid, ask):
+        config_file = "alert_config.csv"
+        if Path(config_file).exists():
+            df = pd.read_csv(config_file)
+            symbol_config = df[df['symbol'] == symbol]
+            if not symbol_config.empty and symbol_config['condition'].iloc[0] == "ON":
+                wav_path = symbol_config['wav_path'].iloc[0]
+                if Path(wav_path).exists():
+                    threading.Thread(target=playsound, args=(wav_path,), daemon=True).start()
+                    self.log_play_event(symbol, datetime.datetime.now(tz=self.tz).strftime('%Y-%m-%d %H:%M:%S'))
+
+    def log_play_event(self, symbol, timestamp):
+        with open("play_log.txt", "a") as f:
+            f.write(f"{timestamp},{symbol},1\n")
+
+    def is_trading(self, row, current_time):
+        symbol = self.schedule_table.item(row, 0).text()
+        start_day = self.schedule_table.cellWidget(row, 2).currentText()
+        start_time_edit = self.schedule_table.cellWidget(row, 3)
+        start_time_str = start_time_edit.time().toString("HH:mm:ss") if start_time_edit else "00:00:00"
+
+        end_day = self.schedule_table.cellWidget(row, 4).currentText()
+        end_time_edit = self.schedule_table.cellWidget(row, 5)
+        end_time_str = end_time_edit.time().toString("HH:mm:ss") if end_time_edit else "00:00:00"
+
+        day_map = {"Monday": 0, "Tuesday": 1, "Wednesday": 2, "Thursday": 3,
+                   "Friday": 4, "Saturday": 5, "Sunday": 6}
+
+        current_weekday = current_time.weekday()
+        week_start = current_time - datetime.timedelta(days=current_weekday)
+
+        start_day_num = day_map[start_day]
+        end_day_num = day_map[end_day]
+
+        start_time = datetime.datetime.strptime(start_time_str, '%H:%M:%S').time()
+        end_time = datetime.datetime.strptime(end_time_str, '%H:%M:%S').time()
+
+        start_datetime = datetime.datetime.combine(
+            week_start.date() + datetime.timedelta(days=start_day_num),
+            start_time,
+            tzinfo=self.tz
+        )
+        end_datetime = datetime.datetime.combine(
+            week_start.date() + datetime.timedelta(days=end_day_num),
+            end_time,
+            tzinfo=self.tz
+        )
+
+        if end_day_num < start_day_num or (end_day_num == start_day_num and end_time < start_time):
+            end_datetime += datetime.timedelta(days=7)
+
+        within_trading_hours = start_datetime <= current_time <= end_datetime
+
+        break_pairs = [(6, 7), (8, 9), (10, 11)]
+        in_break = False
+
+        current_day_num = current_time.weekday()
+        current_day_start = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        for i, (start_col, end_col) in enumerate(break_pairs, 1):
+            start_edit = self.schedule_table.cellWidget(row, start_col)
+            end_edit = self.schedule_table.cellWidget(row, end_col)
+
+            break_start_str = start_edit.time().toString("HH:mm:ss") if start_edit else "00:00:00"
+            break_end_str = end_edit.time().toString("HH:mm:ss") if end_edit else "00:00:00"
+
+            if break_start_str == "00:00:00" and break_end_str == "00:00:00":
+                continue
+
+            break_start_time = datetime.datetime.strptime(break_start_str, '%H:%M:%S').time()
+            break_end_time = datetime.datetime.strptime(break_end_str, '%H:%M:%S').time()
+
+            break_start = datetime.datetime.combine(
+                current_day_start.date(),
+                break_start_time,
+                tzinfo=self.tz
+            )
+            break_end = datetime.datetime.combine(
+                current_day_start.date(),
+                break_end_time,
+                tzinfo=self.tz
+            )
+
+            if break_end < break_start:
+                break_end += datetime.timedelta(days=1)
+
+            if break_start <= current_time <= break_end:
+                in_break = True
+                break
+
+        return within_trading_hours and not in_break
+
+    def start_monitoring(self):
+        if not self.running:
+            if not mt5.initialize():
+                print("Failed to initialize MT5")
+                QMessageBox.critical(self, "Error", "Failed to initialize MT5")
+                return
+
+            self.running = True
+            self.refresh_timer.start(1000)
+
+            self.price_thread = threading.Thread(target=self.monitor_prices)
+            self.price_thread.daemon = True
+            self.price_thread.start()
+            self.status_label.setText(f"Last Refresh: Not yet refreshed | Status: Running")
+            print("Monitoring started")
+
+    def stop_monitoring(self):
+        self.running = False
+        self.refresh_timer.stop()
+        self.status_label.setText(f"Last Refresh: Stopped | Status: Stopped")
+        print("Monitoring stopped")
+
+    def closeEvent(self, event):
+        self.save_config()  # 在關閉前儲存設定
+        self.running = False
+        self.refresh_timer.stop()
+        mt5.shutdown()
+        event.accept()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.resize_table_columns()
+        self.auto_fit_action.setChecked(self.auto_fit_enabled)
+
+    def resize_table_columns(self):
+        if self.auto_fit_enabled:
+            self.price_table.resizeColumnsToContents()
+            self.price_table.resizeRowsToContents()
+            self.schedule_table.resizeColumnsToContents()
+            self.schedule_table.resizeRowsToContents()
+            self.product_table.resizeColumnsToContents()
+            self.product_table.resizeRowsToContents()
+
+    def toggle_auto_fit(self, checked):
+        self.auto_fit_enabled = checked
+        if checked:
+            self.resize_table_columns()
+
+    def create_toolbar(self):
+        toolbar = QToolBar("Main Toolbar")
+        self.addToolBar(toolbar)
+
+        save_menu = QMenu("Save", self)
+        save_params_action = QAction("Save Parameters", self)
+        save_params_action.triggered.connect(self.save_parameters)
+        save_menu.addAction(save_params_action)
+
+        save_products_action = QAction("Save Products", self)
+        save_products_action.triggered.connect(self.save_product_list)
+        save_menu.addAction(save_products_action)
+
+        load_menu = QMenu("Load", self)
+        load_products_action = QAction("Load Products", self)
+        load_products_action.triggered.connect(self.load_product_list)
+        load_menu.addAction(load_products_action)
+
+        self.auto_fit_action = QAction("Autofit", self)
+        self.auto_fit_action.setCheckable(True)
+        self.auto_fit_action.setChecked(True)
+        self.auto_fit_action.triggered.connect(self.toggle_auto_fit)
+
+        toggle_all_alerts_action = QAction("Toggle All Alerts", self)
+        toggle_all_alerts_action.triggered.connect(self.toggle_all_alerts)
+
+        exit_action = QAction("Exit", self)
+        exit_action.triggered.connect(self.close)
+
+        toolbar.addAction(save_menu.menuAction())
+        toolbar.addAction(load_menu.menuAction())
+        toolbar.addSeparator()
+        toolbar.addAction(self.auto_fit_action)
+        toolbar.addAction(toggle_all_alerts_action)
+        toolbar.addAction(exit_action)
+
+    def toggle_all_alerts(self):
+        all_checked = all(self.alert_enabled[symbol] for symbol in self.symbols)
+        new_state = not all_checked
+
+        for i, symbol in enumerate(self.symbols):
+            self.alert_enabled[symbol] = new_state
+            checkbox = self.price_table.cellWidget(i, 0)
+            if checkbox:
+                checkbox.setChecked(new_state)
+
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = PriceMonitor()
+    window.show()
+    sys.exit(app.exec())
+
